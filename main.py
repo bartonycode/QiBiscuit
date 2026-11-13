@@ -1,48 +1,152 @@
-"""Run the CHBrClF active-space, VQE, and effective pulse-steering pipeline."""
+"""VQE-to-laser Toy Demonstration."""
 
-from __future__ import annotations
-
-import numpy as np
-import json
 from pathlib import Path
 
-from environment import check_environment
-from molecule_driver import build_chbrclf_qubit_hamiltonian
-from pulse_steering import optimize_laser_parameters
-from vqe_solver import run_vqe_simulation, measure_vqe_readout
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+from scipy.linalg import expm
+from scipy.optimize import minimize
 
 
-def main() -> None:
-    """Run the molecular calculation and save the pulse population plot."""
-    for package, package_version in check_environment().items():
-        print(f"{package}=={package_version}")
+# Step 1: a supplied 4x4 toy matrix, not an ab initio molecular calculation.
+H_mol = np.array(
+    [
+        [-0.800, 0.000, 0.000, 0.000],
+        [0.000, -1.137, 0.082, 0.000],
+        [0.000, 0.082, -0.450, 0.000],
+        [0.000, 0.000, 0.000, -0.200],
+    ],
+    dtype=float,
+)
 
-    _, reduced_problem, mapper, qubit_hamiltonian = (
-        build_chbrclf_qubit_hamiltonian()
+
+# Step 2: prepare a two-qubit trial state using exactly three gates.
+def make_vqe_circuit(theta: float) -> QuantumCircuit:
+    circuit = QuantumCircuit(2)
+    circuit.x(0)
+    circuit.ry(theta, 1)
+    circuit.cx(1, 0)
+    return circuit
+
+
+def energy_for_angle(parameters: np.ndarray) -> float:
+    state = Statevector(make_vqe_circuit(float(parameters[0]))).data
+    return float(np.real(state.conj().T @ H_mol @ state))
+
+
+optimization = minimize(energy_for_angle, x0=[0.0], method="BFGS", tol=1e-12)
+theta = float(optimization.x[0])
+E_ideal = float(optimization.fun)
+ideal_state = Statevector(make_vqe_circuit(theta)).data
+rho_ideal = np.outer(ideal_state, ideal_state.conj())
+
+# This is a simple mixed-state noise estimate, not a hardware noise simulation.
+rho_noisy = 0.98 * rho_ideal + (0.02 / 4) * np.eye(4)
+E_noisy = float(np.trace(H_mol @ rho_noisy).real)
+
+
+# Step 3: use the toy VQE result to set the model's resonance reference.
+E_excited = -0.950
+exact_gap = E_excited - E_ideal
+laser_frequency = exact_gap  # hbar = 1, so energy and angular frequency share units.
+vqe_detuning = abs(laser_frequency - exact_gap)
+noise_detuning = abs(E_ideal - E_noisy)
+mistuned_detuning = 0.06
+
+
+# Step 4: repeat a simple three-level pump-and-relax cycle six times.
+LEFT, RIGHT, EXCITED = range(3)
+INITIAL_DENSITY = np.diag([0.5, 0.5, 0.0]).astype(complex)
+CYCLE_COUNT = 6
+
+
+def distillation_curve(detuning: float) -> np.ndarray:
+    """Return right-state population after each pump and 50/50 relaxation."""
+    omega = 0.02
+    t_pulse = np.pi / (2 * omega)
+    H_pulse = np.array(
+        [
+            [0.0, 0.0, omega],
+            [0.0, 0.0, 0.0],
+            [omega, 0.0, detuning],
+        ],
+        dtype=complex,
     )
-    vqe_result, exact_result = run_vqe_simulation(reduced_problem, mapper)
-    readout = measure_vqe_readout(vqe_result)
+    unitary = expm(-1j * H_pulse * t_pulse)
 
-    # Treat the gap between the two lowest electronic levels as an effective
-    # R/S tunnelling splitting; the molecular operator does not encode chirality.
-    electronic_levels = np.linalg.eigvalsh(qubit_hamiltonian.to_matrix())
-    if electronic_levels.size < 2:
-        raise RuntimeError("At least two electronic levels are needed for steering.")
-    lower, upper = electronic_levels[:2]
-    level_gap = float(upper - lower)
-    mean_energy = float((upper + lower) / 2.0)
-    effective_h0 = np.array(
-        [[mean_energy, level_gap / 2.0], [level_gap / 2.0, mean_energy]],
-        dtype=np.complex128,
+    # Keep existing ground-state populations; split excited population equally.
+    keep_ground = np.diag([1.0, 1.0, 0.0]).astype(complex)
+    decay_left = np.zeros((3, 3), dtype=complex)
+    decay_right = np.zeros((3, 3), dtype=complex)
+    decay_left[LEFT, EXCITED] = 1 / np.sqrt(2)
+    decay_right[RIGHT, EXCITED] = 1 / np.sqrt(2)
+    relaxation = (keep_ground, decay_left, decay_right)
+
+    density = INITIAL_DENSITY.copy()
+    right_populations = [float(density[RIGHT, RIGHT].real)]
+    for _ in range(CYCLE_COUNT):
+        density = unitary @ density @ unitary.conj().T
+        density = sum(
+            (operator @ density @ operator.conj().T for operator in relaxation),
+            start=np.zeros((3, 3), dtype=complex),
+        )
+        ground_population = density[LEFT, LEFT].real + density[RIGHT, RIGHT].real
+        right_populations.append(
+            float(density[RIGHT, RIGHT].real / ground_population)
+        )
+    return np.array(right_populations)
+
+
+curves = {
+    "VQE-tuned laser": (vqe_detuning, distillation_curve(vqe_detuning)),
+    "2% depolarizing-noise model": (
+        noise_detuning,
+        distillation_curve(noise_detuning),
+    ),
+    "Mistuned laser (no VQE)": (
+        mistuned_detuning,
+        distillation_curve(mistuned_detuning),
+    ),
+}
+
+figure, axis = plt.subplots(figsize=(8, 5))
+cycles = np.arange(CYCLE_COUNT + 1)
+for label, (detuning, populations) in curves.items():
+    axis.plot(
+        cycles,
+        100 * populations,
+        marker="o",
+        linewidth=2,
+        label=f"{label} (detuning={detuning:.4f})",
     )
-    pulse = optimize_laser_parameters(effective_h0)
-    report = {
-        "energy_difference_Ha": float(abs(vqe_result.eigenvalue - exact_result.eigenvalue)),
-        "pulse_effective_model": pulse,
-        "synthetic_readout": readout,
-    }
-    Path("validation_results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+axis.set(
+    title="Toy-model right-state population after repeated laser cycles",
+    xlabel="Distillation cycle",
+    ylabel="Right-state population (%)",
+    xticks=cycles,
+    ylim=(45, 101),
+)
+axis.grid(True, alpha=0.3)
+axis.legend()
+figure.tight_layout()
+plot_path = Path(__file__).resolve().with_name("chiral_distillation.png")
+figure.savefig(plot_path, dpi=180)
+plt.close(figure)
 
 
-if __name__ == "__main__":
-    main()
+print(f"VQE circuit gates: {sum(make_vqe_circuit(theta).count_ops().values())}")
+print(f"Best angle: {theta:.4f} radians")
+print(f"E_ideal: {E_ideal:.6f} Ha (toy matrix units)")
+print(f"E_noisy: {E_noisy:.6f} Ha (2% mixed-state estimate)")
+print(f"Exact model energy gap: {exact_gap:.6f} Ha (hbar = 1)")
+for label, (detuning, populations) in curves.items():
+    print(
+        f"{label}: detuning={detuning:.6f}, "
+        f"final right-state population={100 * populations[-1]:.2f}%"
+    )
+print(f"Saved chart to {plot_path}")
